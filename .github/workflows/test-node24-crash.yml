@@ -1,21 +1,27 @@
-name: "Test: Node.js 24 + download-artifact@v4 Crash"
+name: "Test: Node.js 22/24 + download-artifact stream crash"
 
 on:
   push:
   workflow_dispatch:
 
+# Investigating why cloudposse/github-action-matrix-outputs-read fails in Node 22/24:
+# actions/download-artifact@v4 has a timer bug where response.message.destroy(err)
+# emits 'error' with no listeners → uncaught exception → process crash.
+# Node.js timeline: nextTick runs BEFORE promise microtasks.
+# So even v7's "fix" (adding reject()) still crashes.
+
 jobs:
-  test-node24-crash:
+  test-stream-crash:
     runs-on: ubuntu-latest
     steps:
-      - name: Show runtime info
+      - name: Runtime info
         run: |
           echo "Node: $(node --version)"
           echo "npm:  $(npm --version)"
-          echo "OS:   $(uname -r)"
+          echo "Note: GHA now forces node20 actions to run on $(node --version)"
 
       - name: Create dummy file
-        run: echo "test-content" > /tmp/testfile.txt
+        run: echo "test" > /tmp/testfile.txt
 
       - name: Upload test artifact
         uses: actions/upload-artifact@v4
@@ -23,9 +29,7 @@ jobs:
           name: test-artifact
           path: /tmp/testfile.txt
 
-      # ─────────────────────────────────────────────────────────────
-      # Test A: Normal download-artifact@v4 (baseline, must succeed)
-      # ─────────────────────────────────────────────────────────────
+      # ─── Test A: Normal @v4 download ──────────────────────────────────
       - name: "Test A: Normal download-artifact@v4 (expect: success)"
         id: test_a
         uses: actions/download-artifact@v4
@@ -34,165 +38,194 @@ jobs:
           path: /tmp/downloaded
 
       - name: "Test A result"
-        run: |
-          echo "✓ Normal @v4 download succeeded on Node $(node --version)"
-          cat /tmp/downloaded/testfile.txt
+        run: echo "✓ Normal @v4 download succeeded — Node $(node --version) compatible for non-timeout paths"
 
-      # ─────────────────────────────────────────────────────────────
-      # Diagnostic: how many error listeners does .pipe() add?
-      # ─────────────────────────────────────────────────────────────
-      - name: "Diagnostic: error listeners after .pipe()"
+      # ─── Diagnostic ───────────────────────────────────────────────────
+      - name: "Diagnostic: error listeners added by .pipe()"
         run: |
           node - << 'EOF'
           const { PassThrough } = require('stream');
           const readable = new PassThrough();
           const writable = new PassThrough();
           readable.pipe(writable);
-          console.log('Node version:', process.version);
+          console.log('Node:', process.version);
           console.log('error listeners on readable after .pipe():', readable.listenerCount('error'));
           console.log('error listeners on writable after .pipe():', writable.listenerCount('error'));
+          console.log('=> .pipe() does NOT protect readable from unhandled error events');
           EOF
 
-      # ─────────────────────────────────────────────────────────────
-      # Test B: Replicate v4 streamExtractExternal timer bug
-      #   response_message.destroy(err) with NO reject()
-      #   → if readable has 0 error listeners → uncaught exception → crash
-      # ─────────────────────────────────────────────────────────────
-      - name: "Test B: v4 timer bug — destroy without reject (expect: crash on Node 24)"
+      # ─── Test B: v4 timer bug ─────────────────────────────────────────
+      # response.message has 0 error listeners; destroy(err) → nextTick error → crash
+      - name: "Test B: v4 timerFn — destroy, no reject (expect: crash)"
         id: test_b
         continue-on-error: true
         run: |
           node - << 'EOF'
           const { PassThrough } = require('stream');
 
-          function simulateV4Download() {
+          function simulateV4() {
             return new Promise((resolve, reject) => {
-              // Mimic response.message (IncomingMessage / Readable)
-              const response_message = new PassThrough();
-              // Mimic the extractStream pipeline
-              const extractStream = new PassThrough();
+              const response_message = new PassThrough();  // = response.message
+              const passThrough = new PassThrough();        // = extractStream
+              response_message.pipe(passThrough);
 
-              // v4 pipes with NO error handler on response_message
-              response_message.pipe(extractStream);
+              console.log('[v4] error listeners on response_message:', response_message.listenerCount('error'));
 
-              const errListenerCount = response_message.listenerCount('error');
-              console.log('[v4] error listeners on response_message:', errListenerCount);
-
-              extractStream.on('error', (err) => {
-                console.log('[v4] extractStream.error fired:', err.message);
-                reject(err);
+              passThrough.on('error', (err) => {
+                clearTimeout(timer);
+                reject(err);  // This never fires for response_message errors
               });
 
-              // v4's timerFn — bug: missing reject()
+              // v4 timerFn: BUG — no reject()
               const timerFn = () => {
-                console.log('[v4] timer fired → calling response_message.destroy(error)');
-                response_message.destroy(
-                  new Error('Blob storage chunk did not respond in 30000ms')
-                );
-                // BUG: no reject() here!
-                // If errListenerCount === 0, this emits 'error' with no listeners
-                // → Node throws uncaught exception → process exits 1
+                console.log('[v4] timer fired → response_message.destroy(err) — no reject()');
+                response_message.destroy(new Error('Blob storage chunk did not respond in 30000ms'));
+                // No reject() → even if process survived, Promise would hang
               };
-
-              setTimeout(timerFn, 300);  // 300ms instead of 30s
-              resolve('v4 timer armed');
+              const timer = setTimeout(timerFn, 300);
+              resolve('armed');
             });
           }
 
           console.log('Node:', process.version);
-          simulateV4Download()
-            .then(msg => console.log('[v4] resolved:', msg))
-            .catch(err => console.log('[v4] rejected:', err.message));
+          simulateV4()
+            .then(() => console.log('waiting for timer...'))
+            .catch(err => console.log('Promise rejected:', err.message));
           EOF
 
       - name: "Test B result"
         run: |
-          OUTCOME="${{ steps.test_b.outcome }}"
-          NODE="$(node --version)"
-          echo "Test B outcome: ${OUTCOME}"
-          if [ "${OUTCOME}" = "failure" ]; then
-            echo "✓ CONFIRMED: v4 timer bug CRASHES on ${NODE} (unhandled 'error' event)"
+          if [ "${{ steps.test_b.outcome }}" = "failure" ]; then
+            echo "✓ CONFIRMED: v4 timer bug CRASHES on Node $(node --version)"
+            echo "  Crash: response_message has 0 error listeners → unhandled 'error' event → exit 1"
           else
-            echo "✗ UNEXPECTED: v4 timer bug did NOT crash on ${NODE}"
-            echo "  Either Node version handles it, or error propagated through pipe"
+            echo "✗ UNEXPECTED: v4 timer bug did NOT crash"
           fi
 
-      # ─────────────────────────────────────────────────────────────
-      # Test C: v7 fix — destroy + explicit reject()
-      #   Promise.reject() runs BEFORE 'error' event propagates
-      #   → no uncaught exception, graceful failure
-      # ─────────────────────────────────────────────────────────────
-      - name: "Test C: v7 fix — destroy + explicit reject (expect: graceful success)"
+      # ─── Test C: v7 add reject() — still crashes ──────────────────────
+      # v7 calls reject() AFTER destroy(). But nextTick runs BEFORE microtasks.
+      # So: destroy() schedules nextTick error → reject() → timerFn returns
+      #    → nextTick queue: emitErrorNT fires → 0 error listeners → CRASH
+      #    → microtask queue: .catch() never runs (process already dead)
+      - name: "Test C: v7 timerFn — destroy + reject (expect: ALSO crashes)"
         id: test_c
+        continue-on-error: true
         run: |
           node - << 'EOF'
           const { PassThrough } = require('stream');
 
-          function simulateV7Download() {
+          function simulateV7() {
             return new Promise((resolve, reject) => {
               const response_message = new PassThrough();
-              const extractStream = new PassThrough();
+              const passThrough = new PassThrough();
+              response_message.pipe(passThrough);
 
-              response_message.pipe(extractStream);
+              console.log('[v7] error listeners on response_message:', response_message.listenerCount('error'));
 
-              const errListenerCount = response_message.listenerCount('error');
-              console.log('[v7] error listeners on response_message:', errListenerCount);
-
-              extractStream.on('error', (err) => {
-                console.log('[v7] extractStream.error fired (after reject already called):', err.message);
+              passThrough.on('error', (err) => {
+                clearTimeout(timer);
+                reject(err);
               });
 
-              // v7's timerFn — fix: explicit reject() before destroy
+              // v7 timerFn: adds reject() — but destroy()'s error fires via nextTick
+              // nextTick has HIGHER priority than Promise microtasks in Node.js
+              // So reject() doesn't prevent the unhandled error event
               const timerFn = () => {
-                console.log('[v7] timer fired → explicit reject() first, then destroy');
+                console.log('[v7] timer fired → destroy(err) + reject(err)');
                 const err = new Error('Blob storage chunk did not respond in 30000ms');
-                response_message.destroy(err);
-                reject(err);  // ← v7 FIX: reject() called explicitly
+                response_message.destroy(err);  // schedules nextTick error emission
+                reject(err);                     // marks Promise rejected (microtask)
+                // Order: nextTick (crash) runs BEFORE .catch() microtask
               };
-
-              setTimeout(timerFn, 300);
-              resolve('v7 timer armed');
+              const timer = setTimeout(timerFn, 300);
+              resolve('armed');
             });
           }
 
           console.log('Node:', process.version);
-          simulateV7Download()
-            .then(msg => console.log('[v7] resolved:', msg))
-            .catch(err => {
-              console.log('[v7] gracefully rejected:', err.message);
-              console.log('✓ v7 fix: controlled rejection, no crash');
-              // In real v7, this triggers the retry loop upstream
-              // Exit 0 to mark step as success
-              process.exitCode = 0;
-            });
+          simulateV7()
+            .then(() => console.log('waiting for timer...'))
+            .catch(err => console.log('[v7] Promise rejected:', err.message));
           EOF
 
       - name: "Test C result"
         run: |
-          echo "Test C outcome: ${{ steps.test_c.outcome }}"
-          echo "✓ v7 fix handled gracefully on Node $(node --version)"
+          if [ "${{ steps.test_c.outcome }}" = "failure" ]; then
+            echo "✓ CONFIRMED: v7 'fix' ALSO crashes — reject() alone doesn't prevent unhandled error event"
+            echo "  nextTick (emitErrorNT) runs BEFORE Promise microtask (.catch handler)"
+          else
+            echo "✗ UNEXPECTED: v7 did NOT crash (Node $(node --version) may handle this differently)"
+          fi
 
-      # ─────────────────────────────────────────────────────────────
-      # Summary
-      # ─────────────────────────────────────────────────────────────
+      # ─── Test D: Real fix — add error handler on response.message ─────
+      # The real fix: response_message.on('error', ...) prevents unhandled event
+      - name: "Test D: Real fix — add error handler on response_message (expect: graceful)"
+        id: test_d
+        run: |
+          node - << 'EOF'
+          const { PassThrough } = require('stream');
+
+          function simulateRealFix() {
+            return new Promise((resolve, reject) => {
+              const response_message = new PassThrough();
+              const passThrough = new PassThrough();
+              response_message.pipe(passThrough);
+
+              // THE FIX: add error listener on response_message itself
+              response_message.on('error', (err) => {
+                console.log('[fix] response_message.error caught:', err.message);
+                reject(err);
+              });
+
+              console.log('[fix] error listeners on response_message:', response_message.listenerCount('error'));
+
+              passThrough.on('error', (err) => {
+                clearTimeout(timer);
+                reject(err);
+              });
+
+              const timerFn = () => {
+                console.log('[fix] timer fired → response_message.destroy(err)');
+                const err = new Error('Blob storage chunk did not respond in 30000ms');
+                response_message.destroy(err);  // error goes to response_message.on('error')
+                reject(err);                     // also reject explicitly
+              };
+              const timer = setTimeout(timerFn, 300);
+              resolve('armed');
+            });
+          }
+
+          console.log('Node:', process.version);
+          simulateRealFix()
+            .then(() => console.log('waiting for timer...'))
+            .catch(err => {
+              console.log('[fix] Promise gracefully rejected:', err.message);
+              console.log('✓ No crash — error handler on response_message prevents unhandled event');
+            });
+          EOF
+
+      - name: "Test D result"
+        run: |
+          if [ "${{ steps.test_d.outcome }}" = "success" ]; then
+            echo "✓ CONFIRMED: Adding .on('error') to response_message prevents crash on Node $(node --version)"
+          else
+            echo "✗ UNEXPECTED: Real fix also crashed"
+          fi
+
+      # ─── Summary ──────────────────────────────────────────────────────
       - name: Final Summary
         if: always()
         run: |
           echo ""
-          echo "=========================================="
-          echo " Node.js 24 + download-artifact@v4 Test"
-          echo "=========================================="
-          echo " Node version : $(node --version)"
+          echo "=============================================="
+          echo " Stream crash test — Node $(node --version)"
+          echo "=============================================="
           echo ""
-          echo " Test A  Normal @v4 download       : ${{ steps.test_a.outcome }}"
-          echo " Test B  v4 timer bug (no reject)  : ${{ steps.test_b.outcome }}  ← expect: failure"
-          echo " Test C  v7 fix (explicit reject)  : ${{ steps.test_c.outcome }}  ← expect: success"
+          echo " Test A  Normal @v4 download                    : ${{ steps.test_a.outcome }}"
+          echo " Test B  v4 timer (destroy, no reject)          : ${{ steps.test_b.outcome }}  ← expect: failure (crash)"
+          echo " Test C  v7 timer (destroy + reject)            : ${{ steps.test_c.outcome }}  ← expect: failure (still crashes)"
+          echo " Test D  Real fix (.on('error') on readable)    : ${{ steps.test_d.outcome }}  ← expect: success"
           echo ""
-          if [ "${{ steps.test_b.outcome }}" = "failure" ] && [ "${{ steps.test_c.outcome }}" = "success" ]; then
-            echo " CONCLUSION: Node $(node --version) confirms the v4 crash bug."
-            echo "             download-artifact@v4 will crash on 30s timeout in this env."
-            echo "             download-artifact@v7 fix prevents the crash."
-          elif [ "${{ steps.test_b.outcome }}" = "success" ]; then
-            echo " CONCLUSION: v4 bug NOT reproduced on Node $(node --version)."
-            echo "             The error may have propagated through the pipe."
-          fi
+          echo " Key finding: nextTick priority > Promise microtask"
+          echo "   destroy(err) → schedules nextTick → emits error BEFORE .catch() runs"
+          echo "   Real fix: add response_message.on('error', ...) to absorb the error event"
