@@ -1,0 +1,198 @@
+name: "Test: Node.js 24 + download-artifact@v4 Crash"
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-node24-crash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show runtime info
+        run: |
+          echo "Node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          echo "OS:   $(uname -r)"
+
+      - name: Create dummy file
+        run: echo "test-content" > /tmp/testfile.txt
+
+      - name: Upload test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifact
+          path: /tmp/testfile.txt
+
+      # ─────────────────────────────────────────────────────────────
+      # Test A: Normal download-artifact@v4 (baseline, must succeed)
+      # ─────────────────────────────────────────────────────────────
+      - name: "Test A: Normal download-artifact@v4 (expect: success)"
+        id: test_a
+        uses: actions/download-artifact@v4
+        with:
+          name: test-artifact
+          path: /tmp/downloaded
+
+      - name: "Test A result"
+        run: |
+          echo "✓ Normal @v4 download succeeded on Node $(node --version)"
+          cat /tmp/downloaded/testfile.txt
+
+      # ─────────────────────────────────────────────────────────────
+      # Diagnostic: how many error listeners does .pipe() add?
+      # ─────────────────────────────────────────────────────────────
+      - name: "Diagnostic: error listeners after .pipe()"
+        run: |
+          node - << 'EOF'
+          const { PassThrough } = require('stream');
+          const readable = new PassThrough();
+          const writable = new PassThrough();
+          readable.pipe(writable);
+          console.log('Node version:', process.version);
+          console.log('error listeners on readable after .pipe():', readable.listenerCount('error'));
+          console.log('error listeners on writable after .pipe():', writable.listenerCount('error'));
+          EOF
+
+      # ─────────────────────────────────────────────────────────────
+      # Test B: Replicate v4 streamExtractExternal timer bug
+      #   response_message.destroy(err) with NO reject()
+      #   → if readable has 0 error listeners → uncaught exception → crash
+      # ─────────────────────────────────────────────────────────────
+      - name: "Test B: v4 timer bug — destroy without reject (expect: crash on Node 24)"
+        id: test_b
+        continue-on-error: true
+        run: |
+          node - << 'EOF'
+          const { PassThrough } = require('stream');
+
+          function simulateV4Download() {
+            return new Promise((resolve, reject) => {
+              // Mimic response.message (IncomingMessage / Readable)
+              const response_message = new PassThrough();
+              // Mimic the extractStream pipeline
+              const extractStream = new PassThrough();
+
+              // v4 pipes with NO error handler on response_message
+              response_message.pipe(extractStream);
+
+              const errListenerCount = response_message.listenerCount('error');
+              console.log('[v4] error listeners on response_message:', errListenerCount);
+
+              extractStream.on('error', (err) => {
+                console.log('[v4] extractStream.error fired:', err.message);
+                reject(err);
+              });
+
+              // v4's timerFn — bug: missing reject()
+              const timerFn = () => {
+                console.log('[v4] timer fired → calling response_message.destroy(error)');
+                response_message.destroy(
+                  new Error('Blob storage chunk did not respond in 30000ms')
+                );
+                // BUG: no reject() here!
+                // If errListenerCount === 0, this emits 'error' with no listeners
+                // → Node throws uncaught exception → process exits 1
+              };
+
+              setTimeout(timerFn, 300);  // 300ms instead of 30s
+              resolve('v4 timer armed');
+            });
+          }
+
+          console.log('Node:', process.version);
+          simulateV4Download()
+            .then(msg => console.log('[v4] resolved:', msg))
+            .catch(err => console.log('[v4] rejected:', err.message));
+          EOF
+
+      - name: "Test B result"
+        run: |
+          OUTCOME="${{ steps.test_b.outcome }}"
+          NODE="$(node --version)"
+          echo "Test B outcome: ${OUTCOME}"
+          if [ "${OUTCOME}" = "failure" ]; then
+            echo "✓ CONFIRMED: v4 timer bug CRASHES on ${NODE} (unhandled 'error' event)"
+          else
+            echo "✗ UNEXPECTED: v4 timer bug did NOT crash on ${NODE}"
+            echo "  Either Node version handles it, or error propagated through pipe"
+          fi
+
+      # ─────────────────────────────────────────────────────────────
+      # Test C: v7 fix — destroy + explicit reject()
+      #   Promise.reject() runs BEFORE 'error' event propagates
+      #   → no uncaught exception, graceful failure
+      # ─────────────────────────────────────────────────────────────
+      - name: "Test C: v7 fix — destroy + explicit reject (expect: graceful success)"
+        id: test_c
+        run: |
+          node - << 'EOF'
+          const { PassThrough } = require('stream');
+
+          function simulateV7Download() {
+            return new Promise((resolve, reject) => {
+              const response_message = new PassThrough();
+              const extractStream = new PassThrough();
+
+              response_message.pipe(extractStream);
+
+              const errListenerCount = response_message.listenerCount('error');
+              console.log('[v7] error listeners on response_message:', errListenerCount);
+
+              extractStream.on('error', (err) => {
+                console.log('[v7] extractStream.error fired (after reject already called):', err.message);
+              });
+
+              // v7's timerFn — fix: explicit reject() before destroy
+              const timerFn = () => {
+                console.log('[v7] timer fired → explicit reject() first, then destroy');
+                const err = new Error('Blob storage chunk did not respond in 30000ms');
+                response_message.destroy(err);
+                reject(err);  // ← v7 FIX: reject() called explicitly
+              };
+
+              setTimeout(timerFn, 300);
+              resolve('v7 timer armed');
+            });
+          }
+
+          console.log('Node:', process.version);
+          simulateV7Download()
+            .then(msg => console.log('[v7] resolved:', msg))
+            .catch(err => {
+              console.log('[v7] gracefully rejected:', err.message);
+              console.log('✓ v7 fix: controlled rejection, no crash');
+              // In real v7, this triggers the retry loop upstream
+              // Exit 0 to mark step as success
+              process.exitCode = 0;
+            });
+          EOF
+
+      - name: "Test C result"
+        run: |
+          echo "Test C outcome: ${{ steps.test_c.outcome }}"
+          echo "✓ v7 fix handled gracefully on Node $(node --version)"
+
+      # ─────────────────────────────────────────────────────────────
+      # Summary
+      # ─────────────────────────────────────────────────────────────
+      - name: Final Summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " Node.js 24 + download-artifact@v4 Test"
+          echo "=========================================="
+          echo " Node version : $(node --version)"
+          echo ""
+          echo " Test A  Normal @v4 download       : ${{ steps.test_a.outcome }}"
+          echo " Test B  v4 timer bug (no reject)  : ${{ steps.test_b.outcome }}  ← expect: failure"
+          echo " Test C  v7 fix (explicit reject)  : ${{ steps.test_c.outcome }}  ← expect: success"
+          echo ""
+          if [ "${{ steps.test_b.outcome }}" = "failure" ] && [ "${{ steps.test_c.outcome }}" = "success" ]; then
+            echo " CONCLUSION: Node $(node --version) confirms the v4 crash bug."
+            echo "             download-artifact@v4 will crash on 30s timeout in this env."
+            echo "             download-artifact@v7 fix prevents the crash."
+          elif [ "${{ steps.test_b.outcome }}" = "success" ]; then
+            echo " CONCLUSION: v4 bug NOT reproduced on Node $(node --version)."
+            echo "             The error may have propagated through the pipe."
+          fi
